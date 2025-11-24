@@ -5,10 +5,17 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"time"
 
 	"github.com/ctfer-io/chall-manager/global"
 	"go.etcd.io/etcd/client/v3/concurrency"
 	"go.uber.org/zap"
+)
+
+const (
+	// lockOpTimeout bounds etcd lock operations so they can still finish even if the
+	// originating RPC was canceled.
+	lockOpTimeout = 15 * time.Second
 )
 
 // The etcd distributed lock enables you to have a powerful mutual exclusion (mutex)
@@ -60,6 +67,8 @@ func (lock *EtcdRWLock) Key() string {
 
 func (lock *EtcdRWLock) RLock(ctx context.Context) error {
 	etcdCli := global.GetEtcdManager()
+	ctx, cancel := lockCtx(ctx)
+	defer cancel()
 
 	if err := lock.m3.Lock(ctx); err != nil {
 		return err
@@ -109,6 +118,8 @@ func (lock *EtcdRWLock) RLock(ctx context.Context) error {
 
 func (lock *EtcdRWLock) RUnlock(ctx context.Context) error {
 	etcdCli := global.GetEtcdManager()
+	ctx, cancel := lockCtx(ctx)
+	defer cancel()
 
 	if err := lock.m1.Lock(ctx); err != nil {
 		return err
@@ -146,15 +157,8 @@ func (lock *EtcdRWLock) RUnlock(ctx context.Context) error {
 
 func (lock *EtcdRWLock) RWLock(ctx context.Context) error {
 	etcdCli := global.GetEtcdManager()
-
-	defer func(ctx context.Context, mx *concurrency.Mutex) {
-		if err := mx.Lock(ctx); err != nil {
-			global.Log().Error(ctx, "failed to lock etcd mutex",
-				zap.Error(err),
-				zap.String("key", mx.Key()),
-			)
-		}
-	}(ctx, lock.w)
+	ctx, cancel := lockCtx(ctx)
+	defer cancel()
 
 	if err := lock.m2.Lock(ctx); err != nil {
 		return err
@@ -179,21 +183,40 @@ func (lock *EtcdRWLock) RWLock(ctx context.Context) error {
 	default:
 		return errors.New("invalid etcd filter for " + k)
 	}
-	writeCounter++
-	_, perr := etcdCli.Put(ctx, k, strconv.Itoa(writeCounter))
-	// Don't return perr for now, let's avoid race conditions and starvations
+	nextCounter := writeCounter + 1
 
-	if writeCounter == 1 {
+	acquiredR := false
+	if writeCounter == 0 {
 		if err := lock.r.Lock(ctx); err != nil {
 			return err
 		}
+		acquiredR = true
 	}
 
-	return perr
+	if err := lock.w.Lock(ctx); err != nil {
+		if acquiredR {
+			_ = lock.r.Unlock(ctx)
+		}
+		return err
+	}
+
+	_, perr := etcdCli.Put(ctx, k, strconv.Itoa(nextCounter))
+	if perr != nil {
+		// Roll back to avoid leaving the lock held without a counter update
+		_ = lock.w.Unlock(ctx)
+		if acquiredR {
+			_ = lock.r.Unlock(ctx)
+		}
+		return perr
+	}
+
+	return nil
 }
 
 func (lock *EtcdRWLock) RWUnlock(ctx context.Context) error {
 	etcdCli := global.GetEtcdManager()
+	ctx, cancel := lockCtx(ctx)
+	defer cancel()
 
 	if err := lock.w.Unlock(ctx); err != nil {
 		return err
@@ -235,6 +258,14 @@ func (lock *EtcdRWLock) RWUnlock(ctx context.Context) error {
 
 func (lock *EtcdRWLock) Close() error {
 	return lock.s.Close()
+}
+
+// lockCtx returns a non-cancelable, bounded context so lock/unlock can still
+// reach etcd even if the parent RPC context was canceled upstream.
+func lockCtx(ctx context.Context) (context.Context, context.CancelFunc) {
+	ctx = context.WithoutCancel(ctx)
+	ctx, cancel := context.WithTimeout(ctx, lockOpTimeout)
+	return ctx, cancel
 }
 
 func unlock(ctx context.Context, mx *concurrency.Mutex) {
